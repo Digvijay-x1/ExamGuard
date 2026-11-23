@@ -1,14 +1,28 @@
 
-"""Opt-in single-frame analysis. Frames are not persisted by this service."""
+"""Opt-in single-frame analysis and check-in face identification.
 
+Frames are not persisted by this service. Identification results are
+proposals: the ExamGuard API stores them as pending identity matches that two
+trained verifiers must confirm before anything happens to a candidate.
+"""
+
+import hmac
 import os
 
 import numpy as np
-from fastapi import FastAPI, UploadFile, HTTPException
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 
 app = FastAPI(title="SentinelExam AI service")
 
 MODEL_PATH = os.getenv("YOLO_MODEL_PATH")
+# OpenCV Zoo models for check-in identification: YuNet finds and aligns the
+# face, SFace turns it into a feature vector that is compared by cosine
+# similarity. 0.363 is the SFace authors' recommended cosine threshold.
+FACE_DETECTOR_MODEL_PATH = os.getenv("FACE_DETECTOR_MODEL_PATH")
+FACE_RECOGNIZER_MODEL_PATH = os.getenv("FACE_RECOGNIZER_MODEL_PATH")
+IDENTITY_MATCH_THRESHOLD = float(os.getenv("IDENTITY_MATCH_THRESHOLD", "0.363"))
+IDENTITY_MODEL_VERSION = "opencv-yunet-2023mar+sface-2021dec"
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 try:
     import cv2
@@ -34,8 +48,81 @@ def health():
         "mediapipe": "ready" if MEDIAPIPE_READY else "unavailable",
         "phone_model": "ready" if yolo is not None else "unavailable",
         "looking_away": "not_implemented",
+        "identity_match": "ready" if identity_models_ready() else "unavailable",
         "note": "Phone detection requires a compatible configured YOLO model."
     }
+
+
+def identity_models_ready() -> bool:
+    return cv2 is not None and all(
+        path and os.path.isfile(path)
+        for path in (FACE_DETECTOR_MODEL_PATH, FACE_RECOGNIZER_MODEL_PATH)
+    )
+
+
+def require_service_token(authorization: str | None = Header(default=None)):
+    """Only the ExamGuard API, holding AI_SERVICE_TOKEN, may call /identify."""
+    token = os.getenv("AI_SERVICE_TOKEN")
+    if not token or not authorization or not hmac.compare_digest(authorization, f"Bearer {token}"):
+        raise HTTPException(401, "A valid service credential is required")
+
+
+async def read_image(upload: UploadFile):
+    if upload.content_type and not upload.content_type.startswith("image/"):
+        raise HTTPException(415, "Upload an image file")
+    content = await upload.read()
+    if not content:
+        raise HTTPException(400, "Uploaded image is empty")
+    if len(content) > MAX_IMAGE_BYTES:
+        raise HTTPException(413, "Image exceeds the 10 MB limit")
+    image = cv2.imdecode(np.frombuffer(content, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(400, "Invalid image")
+    return image
+
+
+def faces_in(image):
+    height, width = image.shape[:2]
+    detector = cv2.FaceDetectorYN.create(FACE_DETECTOR_MODEL_PATH, "", (width, height), 0.8)
+    _, faces = detector.detect(image)
+    return [] if faces is None else list(faces)
+
+
+@app.post("/identify", dependencies=[Depends(require_service_token)])
+async def identify(probe: UploadFile = File(...), references: list[UploadFile] = File(...)):
+    """Compare the face in a check-in photo with registered candidate photos.
+
+    Each reference upload's filename is the candidate ID it belongs to. The
+    answer names the most similar reference and its cosine similarity. It is
+    a proposal only: this service creates no record and takes no action.
+    """
+    if not identity_models_ready():
+        raise HTTPException(503, "Identity models are not configured")
+
+    probe_image = await read_image(probe)
+    probe_faces = faces_in(probe_image)
+    result = {
+        "face_count": len(probe_faces),
+        "best_match": None,
+        "threshold": IDENTITY_MATCH_THRESHOLD,
+        "model_version": IDENTITY_MODEL_VERSION,
+    }
+    if len(probe_faces) != 1:
+        return result
+
+    recognizer = cv2.FaceRecognizerSF.create(FACE_RECOGNIZER_MODEL_PATH, "")
+    probe_feature = recognizer.feature(recognizer.alignCrop(probe_image, probe_faces[0]))
+    for reference in references:
+        image = await read_image(reference)
+        faces = faces_in(image)
+        if len(faces) != 1:
+            # A registered photo without exactly one face cannot be compared.
+            continue
+        feature = recognizer.feature(recognizer.alignCrop(image, faces[0]))
+        similarity = float(recognizer.match(probe_feature, feature, cv2.FaceRecognizerSF_FR_COSINE))
+        if result["best_match"] is None or similarity > result["best_match"]["similarity"]:
+            result["best_match"] = {"reference_id": reference.filename, "similarity": round(similarity, 4)}
+    return result
 
 
 @app.post("/analyze")

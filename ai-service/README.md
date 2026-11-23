@@ -16,4 +16,6 @@ with `python -m pip install -r requirements-ai.txt`; configure
 
 MediaPipe supports face landmarks for face presence, multiple faces, and approximate head-pose calculations. Phone detection is optional and requires a compatible YOLO model specified by `YOLO_MODEL_PATH`; the health endpoint reports it as unavailable otherwise. The supplied endpoint intentionally does not claim completed detections until the production model pipeline is enabled and validated.
 
+`POST /identify` is the check-in identification called by the API. It needs `AI_SERVICE_TOKEN` (the same value as the API), `FACE_DETECTOR_MODEL_PATH` (OpenCV Zoo YuNet) and `FACE_RECOGNIZER_MODEL_PATH` (OpenCV Zoo SFace). It returns the closest registered photo and its similarity as a proposal only; the API holds it until two verifiers confirm it (see `docs/compliance/identity-verification-procedure.md`).
+
 Do not send continuous video. Send only disclosed, sampled frames needed for a configured review signal. This service stores no frames; private evidence retention must be explicit and handled by the API/storage layer.

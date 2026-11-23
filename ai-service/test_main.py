@@ -1,4 +1,5 @@
 import asyncio
+import os
 import importlib.util
 from io import BytesIO
 from pathlib import Path
@@ -103,3 +104,85 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual(unavailable.exception.status_code, 503)
         self.assertEqual(unavailable.exception.detail, "Phone-detection model inference is unavailable")
 
+
+
+class FakeImage:
+    shape = (480, 640, 3)
+
+    def __init__(self, name):
+        self.name = name
+
+
+class FakeIdentityCv2:
+    IMREAD_COLOR = 1
+    FaceRecognizerSF_FR_COSINE = 0
+    faces = {"probe": 1, "same-person": 1, "other-person": 1, "group": 2}
+    scores = {"same-person": 0.71, "other-person": 0.12}
+
+    @staticmethod
+    def imdecode(content, _mode):
+        return FakeImage(content.tobytes().decode())
+
+    class FaceDetectorYN:
+        @staticmethod
+        def create(*_args):
+            class Detector:
+                def detect(self, image):
+                    count = FakeIdentityCv2.faces.get(image.name, 0)
+                    return None, [image.name] * count if count else None
+            return Detector()
+
+    class FaceRecognizerSF:
+        @staticmethod
+        def create(*_args):
+            class Recognizer:
+                def alignCrop(self, _image, face):
+                    return face
+
+                def feature(self, crop):
+                    return crop
+
+                def match(self, _probe, reference, _mode):
+                    return FakeIdentityCv2.scores[reference]
+            return Recognizer()
+
+
+def named_upload(content: bytes, filename: str) -> UploadFile:
+    return UploadFile(filename=filename, file=BytesIO(content), headers=Headers({"content-type": "image/jpeg"}))
+
+
+class IdentifyTests(unittest.TestCase):
+    def setUp(self):
+        self.original = service.cv2, service.identity_models_ready
+        service.cv2 = FakeIdentityCv2
+        service.identity_models_ready = lambda: True
+
+    def tearDown(self):
+        service.cv2, service.identity_models_ready = self.original
+
+    def test_returns_the_most_similar_reference_as_a_proposal(self):
+        result = asyncio.run(service.identify(named_upload(b"probe", "check-in.jpg"), [
+            named_upload(b"other-person", "11111111-1111-4111-8111-111111111111"),
+            named_upload(b"same-person", "22222222-2222-4222-8222-222222222222"),
+        ]))
+        self.assertEqual(result["face_count"], 1)
+        self.assertEqual(result["best_match"], {"reference_id": "22222222-2222-4222-8222-222222222222", "similarity": 0.71})
+        self.assertEqual(result["model_version"], service.IDENTITY_MODEL_VERSION)
+
+    def test_no_identification_without_exactly_one_face(self):
+        result = asyncio.run(service.identify(named_upload(b"group", "check-in.jpg"), [named_upload(b"same-person", "22222222-2222-4222-8222-222222222222")]))
+        self.assertEqual(result["face_count"], 2)
+        self.assertIsNone(result["best_match"])
+
+    def test_identify_requires_the_service_credential(self):
+        os.environ["AI_SERVICE_TOKEN"] = "test-service-token"
+        try:
+            with self.assertRaises(HTTPException) as missing:
+                service.require_service_token(None)
+            self.assertEqual(missing.exception.status_code, 401)
+            with self.assertRaises(HTTPException) as wrong:
+                service.require_service_token("Bearer wrong")
+            self.assertEqual(wrong.exception.status_code, 401)
+            service.require_service_token("Bearer test-service-token")
+        finally:
+            del os.environ["AI_SERVICE_TOKEN"]

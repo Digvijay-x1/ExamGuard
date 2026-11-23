@@ -21,6 +21,8 @@ import { isUuid } from './ids.js';
 import { examToJson, policyOf } from './serializers.js';
 import { validateAnswerValue } from './answers.js';
 import { isSupportedImage, isSupportedIdentityDocument } from './upload-validation.js';
+import { AiServiceUnavailable, identifyFace } from './ai-identity.js';
+import { type MatchStatus, REQUIRED_VERIFICATIONS, VERIFIER_ROLES, VERIFIER_TRAINING_MODULE, identityAdmitsCandidate, proposedOutcomeFor, settleIdentityMatch, verifierAuthorizationExpiry, verifierMayVerify } from './identity-verification.js';
 export const validateFileContent = (req: express.Request, res: express.Response, next: express.NextFunction) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
@@ -75,6 +77,13 @@ const questionFields = (data: z.infer<typeof questionInput>, clearMissing = fals
   negativeMarks: data.negativeMarks
 });
 const orgConfig = (organizationId: string) => prisma.proctoringConfig.upsert({ where: { organizationId }, update: {}, create: { organizationId } });
+const identityGate = (match: { status: string; proposedOutcome: string } | null) => {
+  if (!match) return { code: 'identity_check_required', message: 'Take your check-in photo before you start.' };
+  if (match.status === 'pending_verification') return { code: 'identity_check_pending', message: 'Two proctors are checking your photo. You can start once both have confirmed it.' };
+  if (match.status === 'disputed') return { code: 'identity_check_required', message: 'Your photo could not be confirmed. Take a new check-in photo in good light.' };
+  if (match.proposedOutcome === 'admit') return { code: 'identity_check_confirmed', message: 'Your identity is confirmed. You can start the exam.' };
+  return { code: 'identity_check_not_confirmed', message: 'Your identity could not be confirmed for this exam. Your institute will contact you about next steps.' };
+};
 const shuffle = <T>(items: T[]) => { const copy = [...items]; for (let i = copy.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [copy[i], copy[j]] = [copy[j], copy[i]]; } return copy; };
 const proctorEventInput = z.object({ examId: z.string().uuid(), candidateId: z.string().uuid(), sessionId: z.string().uuid().optional(), attemptId: z.string().uuid(), type: z.enum(['face_missing', 'multiple_faces', 'looking_away', 'phone_detected', 'visibility_hidden', 'fullscreen_exit', 'network_interruption', 'camera_permission_lost']), occurredAt: z.string().datetime(), source: z.literal('browser'), details: z.record(z.unknown()).optional(), evidenceKey: z.string().max(512).optional() });
 const radioObservationInput = z.object({ organizationId: z.string().uuid(), examId: z.string().uuid(), candidateId: z.string().uuid(), attemptId: z.string().uuid(), source: z.enum(['bluetooth_le', 'wifi', 'scanner_health']), kind: z.enum(['advertisement', 'access_point', 'scan_unavailable', 'permission_denied', 'scan_error', 'scan_stopped']), rssi: z.number().int().min(-127).max(0).optional(), pseudonym: z.string().min(16).max(128).optional(), scannerStatus: z.enum(['active', 'unavailable', 'permission_denied', 'stopped', 'error']), errorCode: z.string().max(120).optional() }).superRefine((data, ctx) => { if (data.kind === 'advertisement' || data.kind === 'access_point') { if (!data.pseudonym) ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'A session-scoped pseudonym is required for a radio observation' }); if (data.scannerStatus !== 'active') ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Radio observations require an active scanner status' }); } });
@@ -498,6 +507,13 @@ app.post('/api/student/organizations/:organizationId/exams/:examId/start', authe
   if (exam.requireVerification) {
     const verification = await prisma.verificationRequest.findFirst({ where: { organizationId, candidateId: candidate.id, status: 'approved' }, select: { id: true } });
     if (!verification) return res.status(403).json({ error: 'Identity verification is required before starting' });
+    // The face identification from the check-in admits the candidate only
+    // after two verifiers confirmed it (see identity-verification.ts).
+    const identity = await prisma.identityMatch.findFirst({ where: { organizationId, examId: exam.id, candidateId: candidate.id }, orderBy: { createdAt: 'desc' }, select: { status: true, proposedOutcome: true } });
+    if (!identityAdmitsCandidate(identity)) {
+      const gate = identityGate(identity);
+      return res.status(403).json({ error: gate.message, code: gate.code });
+    }
   }
   if (exam.accessCodeHash && !(accessCode && await bcrypt.compare(accessCode, exam.accessCodeHash))) return res.status(403).json({ error: 'Valid access code required' });
   let attempt = await prisma.examAttempt.findUnique({ where: { examId_candidateId: { examId: exam.id, candidateId: candidate.id } } });
@@ -546,6 +562,142 @@ app.post('/api/student/attempts/:attemptId/submit', authenticate, async (req: Au
   if (closed.count === 0) return res.status(409).json({ error: 'Attempt state changed; please reload' });
   await audit(attempt.organizationId, req.auth!.userId, 'attempt.submitted', 'ExamAttempt', attempt.id, { status, receiptCode });
   res.json({ status, receiptCode, submittedAt });
+} catch (error) { next(error); } });
+// Check-in face identification. The AI service compares the check-in photo
+// with the registered photos of every candidate assigned to the exam. The
+// result is stored as a pending IdentityMatch and nothing else happens: the
+// candidate is admitted, or an identity incident is opened, only after two
+// verifiers confirm it in the verification route below.
+app.post('/api/student/organizations/:organizationId/exams/:examId/identity-check', authenticate, upload.single('file'), validateFileContent, async (req: AuthRequest, res, next) => { try {
+  const organizationId = String(req.params.organizationId);
+  const examId = String(req.params.examId);
+  const storage = req.app.get('storage') as StorageInterface;
+  if (!storage.storageConfigured() || !storage.getPrivateDocument) return res.status(503).json({ error: 'The identity check is not available at this institute yet. Ask your proctor for help.' });
+  const candidate = await prisma.candidate.findFirst({ where: { organizationId, userId: req.auth!.userId } });
+  const exam = await prisma.exam.findFirst({ where: { id: examId, organizationId, requireVerification: true, status: { in: ['published', 'scheduled', 'live'] } }, select: { id: true } });
+  if (!candidate || !exam || !req.file || !['image/jpeg', 'image/png', 'image/webp'].includes(req.file.mimetype)) return res.status(403).json({ error: 'An assigned exam with identity checks and a JPEG, PNG or WebP photo are required.' });
+  const assignment = await prisma.examAssignment.findUnique({ where: { examId_candidateId: { examId: exam.id, candidateId: candidate.id } }, select: { id: true } });
+  if (!assignment) return res.status(403).json({ error: 'This exam is not assigned to you.' });
+  const open = await prisma.identityMatch.findFirst({ where: { organizationId, examId: exam.id, candidateId: candidate.id, status: { in: ['pending_verification', 'confirmed'] } }, select: { status: true, proposedOutcome: true } });
+  if (open) { const gate = identityGate(open); return res.status(409).json({ error: gate.message, code: gate.code }); }
+  const references = await prisma.verificationRequest.findMany({ where: { organizationId, status: 'approved', profilePhoto: { not: null }, candidate: { assignments: { some: { examId: exam.id } } } }, select: { candidateId: true, profilePhoto: true } });
+  if (!references.some(reference => reference.candidateId === candidate.id)) return res.status(403).json({ error: 'Your registered photo must be approved before the check-in.' });
+  const gallery = await Promise.all(references.map(async reference => { const photo = await storage.getPrivateDocument!(reference.profilePhoto!); return { candidateId: reference.candidateId, image: photo.body, contentType: photo.contentType }; }));
+  let identification;
+  try {
+    identification = await identifyFace({ image: req.file.buffer, contentType: req.file.mimetype }, gallery);
+  } catch (error) {
+    if (error instanceof AiServiceUnavailable) return res.status(503).json({ error: 'The identity check is unavailable right now. Try again in a few minutes, or ask your proctor for help.' });
+    throw error;
+  }
+  // No usable face means there is no identification to verify: ask for a new photo.
+  if (identification.faceCount !== 1) return res.status(422).json({ error: identification.faceCount === 0 ? 'We could not find your face in the photo. Face the camera in good light and try again.' : 'More than one face is in the photo. Make sure only you are in view and try again.' });
+  const proposal = proposedOutcomeFor(candidate.id, identification.best, identification.threshold);
+  const probeKey = `organizations/${organizationId}/candidates/${candidate.id}/identity-checks/${crypto.randomUUID()}`;
+  await storage.putPrivateDocument(probeKey, req.file.buffer, req.file.mimetype);
+  const match = await prisma.identityMatch.create({ data: { organizationId, examId: exam.id, candidateId: candidate.id, matchedCandidateId: proposal.matchedCandidateId, probeKey, faceCount: identification.faceCount, similarity: identification.best?.similarity ?? null, threshold: identification.threshold, modelVersion: identification.modelVersion, proposedOutcome: proposal.outcome } });
+  await audit(organizationId, req.auth!.userId, 'identity_match.created', 'IdentityMatch', match.id, { proposedOutcome: match.proposedOutcome, modelVersion: match.modelVersion });
+  const gate = identityGate(match);
+  res.status(202).json({ status: match.status, code: gate.code, message: gate.message });
+} catch (error) { next(error); } });
+app.get('/api/student/organizations/:organizationId/exams/:examId/identity-check', authenticate, async (req: AuthRequest, res, next) => { try {
+  const organizationId = String(req.params.organizationId);
+  const candidate = await prisma.candidate.findFirst({ where: { organizationId, userId: req.auth!.userId }, select: { id: true } });
+  if (!candidate) return res.status(403).json({ error: 'Candidate access required' });
+  const match = await prisma.identityMatch.findFirst({ where: { organizationId, examId: String(req.params.examId), candidateId: candidate.id }, orderBy: { createdAt: 'desc' }, select: { status: true, proposedOutcome: true } });
+  const gate = identityGate(match);
+  res.json({ code: gate.code, message: gate.message, canStart: identityAdmitsCandidate(match) });
+} catch (error) { next(error); } });
+// The verification queue. Each verifier sees the photos and the system's
+// proposal, and only how many verifications are recorded, never another
+// verifier's decision or reason, so each decision is made separately.
+app.get('/api/organizations/:organizationId/identity-matches', authenticate, authorize(...VERIFIER_ROLES), async (req: AuthRequest, res, next) => { try {
+  const organizationId = req.auth!.organizationId!;
+  const storage = req.app.get('storage') as StorageInterface;
+  const photo = async (key?: string | null) => (key && storage.storageConfigured() ? storage.privateDocumentUrl(key) : undefined);
+  const person = { select: { id: true, name: true, email: true, verificationRequests: { where: { organizationId, status: 'approved' as const }, select: { profilePhoto: true } } } };
+  const matches = await prisma.identityMatch.findMany({ where: { organizationId, status: 'pending_verification' }, orderBy: { createdAt: 'asc' }, include: { exam: { select: { id: true, title: true } }, candidate: person, matchedCandidate: person, verifications: { select: { verifierId: true } } } });
+  res.json(await Promise.all(matches.map(async match => ({
+    id: match.id,
+    exam: match.exam,
+    createdAt: match.createdAt,
+    proposedOutcome: match.proposedOutcome,
+    similarity: match.similarity,
+    threshold: match.threshold,
+    modelVersion: match.modelVersion,
+    checkInPhotoUrl: await photo(match.probeKey),
+    candidate: { id: match.candidate.id, name: match.candidate.name, email: match.candidate.email, registeredPhotoUrl: await photo(match.candidate.verificationRequests[0]?.profilePhoto) },
+    matchedCandidate: match.matchedCandidate && match.matchedCandidate.id !== match.candidate.id ? { id: match.matchedCandidate.id, name: match.matchedCandidate.name, email: match.matchedCandidate.email, registeredPhotoUrl: await photo(match.matchedCandidate.verificationRequests[0]?.profilePhoto) } : null,
+    verificationsRecorded: match.verifications.length,
+    verificationsRequired: REQUIRED_VERIFICATIONS,
+    youHaveVerified: match.verifications.some(verification => verification.verifierId === req.auth!.userId)
+  }))));
+} catch (error) { next(error); } });
+// The only route that changes an identity match. It records one verifier's
+// decision and settles the match when two different people have decided.
+// Admission (start route) and identity incidents follow only from a match
+// that two verifiers confirmed.
+app.post('/api/organizations/:organizationId/identity-matches/:id/verifications', authenticate, authorize(...VERIFIER_ROLES), async (req: AuthRequest, res, next) => { try {
+  const data = z.object({ decision: z.enum(['confirm', 'reject']), reason: z.string().trim().min(3).max(2000) }).parse(req.body);
+  const organizationId = req.auth!.organizationId!;
+  const verifierId = req.auth!.userId;
+  const id = String(req.params.id);
+  const result: { httpStatus: number; body: unknown; status?: MatchStatus; incidentId?: string } = await prisma.$transaction(async tx => {
+    // Lock the match so two verifiers submitting at the same moment are counted one after the other.
+    await tx.$queryRaw`SELECT "id" FROM "identity_matches" WHERE "id" = ${id}::uuid AND "organizationId" = ${organizationId}::uuid FOR UPDATE`;
+    const match = await tx.identityMatch.findFirst({ where: { id, organizationId }, include: { candidate: { select: { userId: true } }, verifications: { select: { verifierId: true, decision: true } } } });
+    if (!match) return { httpStatus: 404, body: { error: 'Identity match not found' } };
+    const authorization = await tx.identityVerifier.findUnique({ where: { organizationId_userId: { organizationId, userId: verifierId } } });
+    const permitted = verifierMayVerify({ verifierId, role: req.auth!.role, candidateUserId: match.candidate.userId, matchStatus: match.status, alreadyVerifiedBy: match.verifications.map(verification => verification.verifierId), authorization, now: new Date() });
+    if (!permitted.allowed) return { httpStatus: 403, body: { error: permitted.reason } };
+    await tx.identityVerification.create({ data: { organizationId, identityMatchId: match.id, verifierId, decision: data.decision, reason: data.reason } });
+    const status = settleIdentityMatch([...match.verifications, { verifierId, decision: data.decision }]);
+    let incidentId: string | undefined;
+    if (status !== 'pending_verification') {
+      if (status === 'confirmed' && match.proposedOutcome !== 'admit') {
+        const incident = await tx.incident.create({ data: { organizationId, examId: match.examId, candidateId: match.candidateId, type: match.proposedOutcome === 'mismatch' ? 'identity_mismatch' : 'identity_not_matched', severity: 'high', details: 'Two verifiers confirmed that the check-in photo does not match this candidate. The exam has not started. Contact the candidate before deciding next steps.' } });
+        incidentId = incident.id;
+      }
+      await tx.identityMatch.update({ where: { id: match.id }, data: { status, settledAt: new Date(), incidentId } });
+    }
+    return { httpStatus: 201, body: { verificationsRecorded: match.verifications.length + 1, verificationsRequired: REQUIRED_VERIFICATIONS, matchStatus: status }, status, incidentId };
+  });
+  if (result.httpStatus === 201) {
+    await audit(organizationId, verifierId, `identity_match.${data.decision}`, 'IdentityMatch', id, { reason: data.reason });
+    if (result.status && result.status !== 'pending_verification') await audit(organizationId, verifierId, `identity_match.${result.status}`, 'IdentityMatch', id, { incidentId: result.incidentId });
+  }
+  res.status(result.httpStatus).json(result.body);
+} catch (error) {
+  if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') return res.status(409).json({ error: 'You have already verified this identity match. A second verifier must be a different person.' });
+  next(error);
+} });
+// Who may verify: a proctor or administrator whose EG-IDV-1 training is
+// recorded and who was authorized by a different institute administrator.
+app.get('/api/organizations/:organizationId/identity-verifiers', authenticate, authorize(...VERIFIER_ROLES), async (req: AuthRequest, res, next) => { try {
+  const rows = await prisma.identityVerifier.findMany({ where: { organizationId: req.auth!.organizationId! }, orderBy: { authorizedAt: 'desc' }, include: { user: { select: { id: true, name: true, email: true } }, authorizedBy: { select: { id: true, name: true } } } });
+  res.json(rows);
+} catch (error) { next(error); } });
+app.post('/api/organizations/:organizationId/identity-verifiers', authenticate, authorize('institute_admin'), async (req: AuthRequest, res, next) => { try {
+  const data = z.object({ email: z.string().email().transform(value => value.toLowerCase()), trainingModule: z.literal(VERIFIER_TRAINING_MODULE), trainingCompletedAt: z.coerce.date() }).parse(req.body);
+  const organizationId = req.auth!.organizationId!;
+  const now = new Date();
+  const expiresAt = verifierAuthorizationExpiry(data.trainingCompletedAt);
+  if (data.trainingCompletedAt > now || expiresAt <= now) return res.status(400).json({ error: 'Enter an EG-IDV-1 completion date from the last 12 months.' });
+  const user = await prisma.user.findUnique({ where: { email: data.email }, select: { id: true } });
+  const membership = user && await prisma.membership.findFirst({ where: { userId: user.id, organizationId, active: true, role: { in: [...VERIFIER_ROLES] } } });
+  if (!user || !membership) return res.status(404).json({ error: 'No active proctor or administrator with that email belongs to this institute.' });
+  if (user.id === req.auth!.userId) return res.status(403).json({ error: 'Another administrator must authorize you as a verifier.' });
+  const fields = { trainingModule: data.trainingModule, trainingCompletedAt: data.trainingCompletedAt, authorizedById: req.auth!.userId, authorizedAt: now, expiresAt, revokedAt: null, revokedById: null };
+  const verifier = await prisma.identityVerifier.upsert({ where: { organizationId_userId: { organizationId, userId: user.id } }, update: fields, create: { organizationId, userId: user.id, ...fields } });
+  await audit(organizationId, req.auth!.userId, 'identity_verifier.authorized', 'IdentityVerifier', verifier.id, { userId: user.id, trainingModule: data.trainingModule, trainingCompletedAt: data.trainingCompletedAt, expiresAt });
+  res.status(201).json(verifier);
+} catch (error) { next(error); } });
+app.post('/api/organizations/:organizationId/identity-verifiers/:id/revoke', authenticate, authorize('institute_admin'), async (req: AuthRequest, res, next) => { try {
+  const organizationId = req.auth!.organizationId!;
+  const revoked = await prisma.identityVerifier.updateMany({ where: { id: String(req.params.id), organizationId, revokedAt: null }, data: { revokedAt: new Date(), revokedById: req.auth!.userId } });
+  if (revoked.count === 0) return res.status(404).json({ error: 'Active verifier authorization not found' });
+  await audit(organizationId, req.auth!.userId, 'identity_verifier.revoked', 'IdentityVerifier', String(req.params.id));
+  res.json({ revoked: true });
 } catch (error) { next(error); } });
 app.get('/api/organizations/:organizationId/proctoring/config', authenticate, authorize('institute_admin', 'teacher', 'proctor'), async (req: AuthRequest, res, next) => { try {
   res.json(await orgConfig(req.auth!.organizationId!));

@@ -36,7 +36,8 @@ ExamGuard is a multi-tenant examination platform designed for universities and e
   - **Face Detection**: MediaPipe.
   - **Phone Detection**: YOLO (Ultralytics).
   - **Head Pose Estimation**: (Planned) MediaPipe landmarks.
-- **Integration**: The client captures frames and sends them to the backend, which forwards them to the AI service or the client calls the AI service directly (context-dependent).
+  - **Check-in identification**: OpenCV YuNet (face detection and alignment) and SFace (face features), `POST /identify`.
+- **Integration**: The backend calls `/identify` with a service credential when a candidate checks in. The result is a pending identity match that two authorized verifiers must confirm before the candidate is admitted or an incident is opened (`server/src/identity-verification.ts`). The frame analysis endpoint `/analyze` is not called by the backend.
 
 ### 4. Windows Companion (Device Monitor)
 - **Framework**: .NET 8, C#.

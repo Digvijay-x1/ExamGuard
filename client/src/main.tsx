@@ -50,6 +50,7 @@ type Session = {
   role: string;
 };
 import { ExamBuilder } from "./exam-builder";
+import { IdentityCheckIn, IdentityChecks } from "./identity-check";
 const api = axios.create();
 api.interceptors.request.use((c) => {
   const raw = localStorage.getItem("sentinel-session");
@@ -65,6 +66,7 @@ const nav = [
     icon: ShieldCheck,
     path: "/app/verification",
   },
+  { label: "Identity checks", icon: ClipboardCheck, path: "/app/identity-checks" },
   { label: "Live monitoring", icon: Monitor, path: "/app/monitoring" },
   { label: "Incident review", icon: AlertTriangle, path: "/app/incidents" },
   { label: "Results & reports", icon: BarChart3, path: "/app/reports" },
@@ -504,6 +506,7 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
             path="verification"
             element={<Verification session={session} />}
           />
+          <Route path="identity-checks" element={<IdentityChecks api={api} session={session} />} />
           <Route path="monitoring" element={<Monitoring session={session} />} />
           <Route path="incidents" element={<Incidents session={session} />} />
           <Route
@@ -522,6 +525,7 @@ function Shell({ session, clear }: { session: Session; clear: () => void }) {
                 ![
                   "/app/candidates",
                   "/app/verification",
+                  "/app/identity-checks",
                   "/app/monitoring",
                   "/app/incidents",
                   "/app/reports",
@@ -642,6 +646,7 @@ function StudentExam({ session }: { session: Session }) {
   const [pairingError, setPairingError] = useState("");
   const [pairingLoading, setPairingLoading] = useState(false);
   const [attentionWarning, setAttentionWarning] = useState("");
+  const [identityCheck, setIdentityCheck] = useState(false);
   const submitting = useRef(false);
   useEffect(() => () => {
     const stream = (window as any).__examguardCameraStream as MediaStream | undefined;
@@ -677,6 +682,11 @@ function StudentExam({ session }: { session: Session }) {
       );
       void createCompanionPairing(data.attempt.id);
     } catch (e) {
+      // Exams with identity checks start only after two proctors confirm the check-in photo.
+      if (axios.isAxiosError(e) && String(e.response?.data?.code ?? "").startsWith("identity_check")) {
+        setIdentityCheck(true);
+        return;
+      }
       setError(
         axios.isAxiosError(e)
           ? e.response?.data?.error
@@ -769,6 +779,7 @@ function StudentExam({ session }: { session: Session }) {
   useEffect(() => {
     if (payload && left === 0) void submit(true);
   }, [left, payload]);
+  if (!payload && identityCheck) return <IdentityCheckIn api={api} session={session} examId={examId} onConfirmed={start} />;
   if (!payload) return <ReadinessChecks onStart={start} error={error} />;
   if (receipt)
     return (

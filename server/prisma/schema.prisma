@@ -126,6 +126,23 @@ enum PolicyAction {
   technical
 }
 
+enum IdentityMatchStatus {
+  pending_verification
+  confirmed
+  disputed
+}
+
+enum IdentityMatchOutcome {
+  admit
+  mismatch
+  no_match
+}
+
+enum IdentityVerificationDecision {
+  confirm
+  reject
+}
+
 enum Severity {
   low
   medium
@@ -209,6 +226,9 @@ model Organization {
   attemptCodes          AttemptCode[]
   codingSubmissions     CodeSubmission[]
   executionJobs         ExecutionJob[]
+  identityMatches       IdentityMatch[]
+  identityVerifications IdentityVerification[]
+  identityVerifiers     IdentityVerifier[]
 
   @@map("organizations")
 }
@@ -235,6 +255,9 @@ model User {
   notifications         Notification[]
   auditLogs             AuditLog[]
   reviewedRadioSignals  RadioCandidateSignal[]
+  identityVerifications IdentityVerification[]
+  identityVerifierRoles IdentityVerifier[]     @relation("IdentityVerifierUser")
+  authorizedVerifiers   IdentityVerifier[]     @relation("IdentityVerifierAuthorizer")
 
   @@map("users")
 }
@@ -356,6 +379,7 @@ model Exam {
   incidents             Incident[]
   radioObservations     RadioObservation[]
   radioCandidateSignals RadioCandidateSignal[]
+  identityMatches       IdentityMatch[]
 
   @@index([organizationId])
   @@map("exams")
@@ -433,6 +457,8 @@ model Candidate {
   radioObservations     RadioObservation[]
   radioCandidateSignals RadioCandidateSignal[]
   codingSubmissions     CodeSubmission[]
+  identityMatches       IdentityMatch[]        @relation("IdentityMatchClaimed")
+  matchedIdentities     IdentityMatch[]        @relation("IdentityMatchMatched")
 
   @@unique([organizationId, email])
   @@index([userId])
@@ -952,4 +978,78 @@ model RadioSignalObservation {
   @@id([signalId, observationId])
   @@index([observationId])
   @@map("radio_signal_observations")
+}
+
+// A face identification made at exam check-in. proposedOutcome is what the AI
+// service's best match suggests; it takes effect only when status becomes
+// confirmed, which needs two IdentityVerification rows from different users.
+model IdentityMatch {
+  id                 String               @id @default(uuid()) @db.Uuid
+  organizationId     String               @db.Uuid
+  examId             String               @db.Uuid
+  candidateId        String               @db.Uuid
+  matchedCandidateId String?              @db.Uuid
+  probeKey           String
+  faceCount          Int
+  similarity         Float?
+  threshold          Float
+  modelVersion       String
+  proposedOutcome    IdentityMatchOutcome
+  status             IdentityMatchStatus  @default(pending_verification)
+  settledAt          DateTime?
+  incidentId         String?              @db.Uuid
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  organization     Organization           @relation(fields: [organizationId], references: [id])
+  exam             Exam                   @relation(fields: [examId], references: [id])
+  candidate        Candidate              @relation("IdentityMatchClaimed", fields: [candidateId], references: [id])
+  matchedCandidate Candidate?             @relation("IdentityMatchMatched", fields: [matchedCandidateId], references: [id])
+  verifications    IdentityVerification[]
+
+  @@index([organizationId, status])
+  @@index([examId, candidateId])
+  @@map("identity_matches")
+}
+
+// One verifier's own decision on an identity match. The unique index means one
+// person can record only one decision per match.
+model IdentityVerification {
+  id              String                       @id @default(uuid()) @db.Uuid
+  organizationId  String                       @db.Uuid
+  identityMatchId String                       @db.Uuid
+  verifierId      String                       @db.Uuid
+  decision        IdentityVerificationDecision
+  reason          String
+  createdAt       DateTime                     @default(now())
+
+  organization  Organization  @relation(fields: [organizationId], references: [id])
+  identityMatch IdentityMatch @relation(fields: [identityMatchId], references: [id], onDelete: Cascade)
+  verifier      User          @relation(fields: [verifierId], references: [id])
+
+  @@unique([identityMatchId, verifierId])
+  @@index([organizationId])
+  @@map("identity_verifications")
+}
+
+// The record that a proctor or administrator completed EG-IDV-1 training and
+// was authorized by another administrator to verify identity matches.
+model IdentityVerifier {
+  id                  String    @id @default(uuid()) @db.Uuid
+  organizationId      String    @db.Uuid
+  userId              String    @db.Uuid
+  trainingModule      String
+  trainingCompletedAt DateTime
+  authorizedById      String    @db.Uuid
+  authorizedAt        DateTime  @default(now())
+  expiresAt           DateTime
+  revokedAt           DateTime?
+  revokedById         String?   @db.Uuid
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User         @relation("IdentityVerifierUser", fields: [userId], references: [id])
+  authorizedBy User         @relation("IdentityVerifierAuthorizer", fields: [authorizedById], references: [id])
+
+  @@unique([organizationId, userId])
+  @@map("identity_verifiers")
 }

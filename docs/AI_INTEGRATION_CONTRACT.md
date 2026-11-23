@@ -1,30 +1,30 @@
 # AI integration contract
 
-Status: **NOT IMPLEMENTED**. This contract defines the minimum conditions for a future authenticated integration; it is not evidence that model inference is enabled.
+The AI service (`ai-service/main.py`) has two endpoints. Only one is called by the API.
 
-## Current boundary
+| Endpoint | What it does | Called by the API |
+| --- | --- | --- |
+| `POST /identify` | Check-in face identification: compares the face in a check-in photo with the registered photos of the candidates assigned to the exam | Yes, from `POST /api/student/organizations/:organizationId/exams/:examId/identity-check` in `server/src/app.ts` |
+| `POST /analyze` | Single-frame face count and optional phone detection | No. Browser signals (tab and fullscreen) are the only proctoring events today |
 
-`ai-service/main.py` accepts one uploaded image frame in memory, rejects non-images, empty frames, oversized frames, invalid images, unavailable CV dependencies, and unavailable model inference. It does not persist frames, create incidents, grade, pause, terminate, or otherwise act on an exam. The backend currently exposes only AI configuration status and does not call the service.
+## Check-in identification (`/identify`)
 
-## Required contract before implementation
+Decided on 2 November 2026 by the provider, Nekod Test Labs B.V., for the ExamGuard check-in feature.
 
-1. The API must authenticate to a private AI service using a dedicated rotating service credential, never a candidate JWT. The AI service must reject missing or invalid credentials.
-2. The API must authenticate the candidate, verify candidate/organization/attempt ownership, require `in_progress` status, and enforce server deadline before forwarding a frame.
-3. A product decision must define explicit, revocable candidate consent for camera capture and the UI disclosure shown before capture. Consent status must be stored/audited at the exam-session level before any inference call.
-4. The API must send a short-lived request identifier, organization/attempt association, bounded image bytes, MIME type, and no unrelated identity fields. Maximum frame size is 5 MB at the API and 10 MB at the service; the integration must use the lower 5 MB limit.
-5. Frames are processed in memory only. No frame, raw image bytes, biometric template, face identity, device identifier, or inference payload may be logged. Any temporary processing storage must be disabled by default and have an explicit deletion schedule.
-6. The API must use a bounded timeout, cancellation on client disconnect, and a small retry policy only for transient transport failure. It must not retry invalid input or create duplicate review records.
-7. The service response must be validated against a strict schema and include service/model version, model availability, face presence/count, optional phone detection confidence, and explicit limitations. Missing model/version or malformed responses are service failures.
-8. Thresholds and model labels must be configuration reviewed and versioned. No facial recognition is permitted.
-9. A validated response may create only a review-only proctoring event associated with the authorized attempt. It must be deduplicated, auditable, and visible only to authorized reviewers. It must never change attempt state, create a misconduct conclusion, or modify grading.
-10. Health must distinguish API reachability, dependency availability, model availability, and model version. A health response is not inference validation.
+1. The API authenticates to the AI service with `AI_SERVICE_TOKEN` as a bearer credential. The service rejects a missing or wrong credential with 401.
+2. The API checks the candidate, the organization, the exam assignment, that the exam requires verification, and that the candidate's registered photo was approved, before it sends anything.
+3. The API sends the check-in photo and the registered photos of the candidates assigned to the same exam. Each registered photo is named by its candidate ID. Nothing else about the candidates is sent.
+4. The service finds the face with OpenCV YuNet, computes an SFace feature, and returns the face count, the most similar registered photo, its cosine similarity, the threshold (0.363 by default) and the model version. It stores nothing.
+5. The API validates the response (`server/src/ai-identity.ts`) and stores it as an `IdentityMatch` with status `pending_verification`. A malformed answer, a timeout (15 seconds) or a reference the API did not send is a service failure, and no match is stored.
+6. **Two-person verification.** An identification is never acted on by itself. The candidate is admitted to the exam (`admit`) or an identity incident is opened (`mismatch`, `no_match`) only after two different, authorized verifiers have each confirmed the match. The rules are in `server/src/identity-verification.ts` and the procedure is `docs/compliance/identity-verification-procedure.md`.
+7. There is no automatic action on a high similarity score, no administrator override and no other route that changes an `IdentityMatch`.
+8. The check-in photo is stored privately under `organizations/<org>/candidates/<candidate>/identity-checks/`. Feature vectors are not stored.
 
-## Blocking decisions
+## Frame analysis (`/analyze`)
 
-The repository has no persisted consent policy or approved retention schedule for AI frames, no AI service credential configuration, and no approved model/version. Those are product and security decisions, not safe defaults. Therefore an authenticated adapter has deliberately not been added.
+Not integrated. Before the API may call it:
 
-## Evidence required for future verification
-
-- A validated local model and optional dependencies installed on a non-production host.
-- Contract tests for API authentication, candidate ownership, active attempt/deadline checks, payload limits, timeout, malformed response, unavailable model, and deduplicated review-only record creation.
-- A live integration test using only approved test fixtures and no retained images.
+1. The API must authenticate the candidate, verify candidate, organization and attempt ownership, require `in_progress` status and enforce the server deadline before forwarding a frame.
+2. Explicit, revocable candidate consent for camera capture must be stored at the exam-session level before any call.
+3. Frames are processed in memory only. Maximum frame size is 5 MB at the API and 10 MB at the service.
+4. A validated response may create only a review-only proctoring event. It must never change attempt state, create a misconduct conclusion or change grading.

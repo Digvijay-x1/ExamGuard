@@ -53,4 +53,8 @@ Exam attempts have a server-created deadline and cannot be autosaved or submitte
 
 The `ai-service/` FastAPI boundary is software-only and opt-in. It supports a health/capability report for MediaPipe face analysis and an optional YOLO phone model; it does not claim an active detection model when one is absent. Browser signals (visibility/fullscreen) are explicitly distinct from AI signals. There is no fake Bluetooth, Wi-Fi, or other-app discovery because browsers do not provide that capability.
 
-Signals are deduplicated in a configured cooldown window, recorded before Socket.IO broadcasts, and converted to explainable review-priority points—not cheating probabilities or automatic outcomes. Review actions require a reason and create audit entries. Automated signals must be reviewed by authorized people; no signal can automatically fail a student.
+## Check-in identity verification
+
+For exams that require verification, the candidate takes a check-in photo before starting. The API sends it to the AI service's `/identify` endpoint, which compares it with the approved registered photos of the candidates assigned to the exam. The result is stored as a pending identity match. The candidate can start, or an identity incident is opened, only after two different trained and authorized verifiers have each confirmed the match on the **Identity checks** screen. See `docs/compliance/identity-verification-procedure.md` and `server/src/identity-verification.ts`.
+
+Signals are deduplicated in a configured cooldown window, recorded before Socket.IO broadcasts, and converted to explainable review-priority points, not cheating probabilities or automatic outcomes. Review actions require a reason and create audit entries. Automated signals must be reviewed by authorized people; no signal can automatically fail a student.

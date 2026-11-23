@@ -21,7 +21,7 @@ Audit date: 2026-11-06. This is a source and automated-test review, not a penetr
 | Open | Zod 3 advisory for constrained collection exhaustion. | Body size limit and schema bounds mitigate input size; upgrade to Zod 4 requires dedicated compatibility migration. |
 | Open | CORS has a single configured origin but no deployment-specific verification. | Confirm production `CLIENT_URL`, TLS reverse-proxy behavior, and origin policy during deployment. |
 | Open | Password-reset email is an optional webhook adapter. | Verify outbound allowlist, timeout, authentication, and provider privacy contract before enabling. |
-| Blocked | AI service has no authenticated API adapter or approved consent/retention policy. | See `AI_INTEGRATION_CONTRACT.md`; do not expose service publicly. |
+| Partly resolved | The check-in identification (`/identify`) has an authenticated API adapter (`server/src/ai-identity.ts`) and two-person verification. Frame analysis (`/analyze`) has no adapter or approved consent/retention policy. | See `AI_INTEGRATION_CONTRACT.md`; do not expose the service publicly. |
 | Unverified | Database IDOR/cross-tenant integration suites write fixtures. | Their guards are prepared; execution requires owner approval. |
 
 ## Review scope limits
